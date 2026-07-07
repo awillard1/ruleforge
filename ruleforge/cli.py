@@ -155,7 +155,7 @@ def analyze(
 @app.command()
 def generate(
     input_files: Annotated[list[Path], typer.Argument(help="Source rule file(s)")],
-    output: Annotated[Path, typer.Option("--output", "-o")] = Path("learned.rule"),
+    output: Annotated[Path, typer.Option("--output", "--out", "-o")] = Path("learned.rule"),
     count: Annotated[int, typer.Option("--count", "-g", help="Target rule count")] = 200_000,
     seed: Annotated[Optional[int], typer.Option("--seed")] = None,
     max_ops: Annotated[int, typer.Option("--max-ops")] = 10,
@@ -395,25 +395,36 @@ def generate(
 
 @app.command()
 def learn(
-    input_files: Annotated[list[Path], typer.Argument(help="Rule file(s) to learn from")],
+    input_files: Annotated[list[Path], typer.Argument(help="Rule or password file(s) to learn from")],
     templates_out: Annotated[Path, typer.Option("--templates-out")] = Path("templates.json"),
     markov_out: Annotated[Path, typer.Option("--markov-out")] = Path("markov.json"),
     markov_order: Annotated[int, typer.Option("--markov-order")] = 3,
     top_templates: Annotated[int, typer.Option("--top-templates")] = 100,
+    ngram: Annotated[int, typer.Option("--ngram", help="N-gram order (0 to disable)")] = 0,
+    ngram_out: Annotated[Path, typer.Option("--ngram-out")] = Path("ngram.json"),
+    ngram_smoothing: Annotated[str, typer.Option("--ngram-smoothing", help="laplace|backoff|kneser_ney")] = "backoff",
+    grammar: Annotated[bool, typer.Option("--grammar/--no-grammar", help="Learn PCFG grammar from input as password corpus")] = False,
+    grammar_out: Annotated[Path, typer.Option("--grammar-out")] = Path("grammar.json"),
     verbose: _OPT_VERBOSE = 0,
 ) -> None:
-    """Learn templates and Markov models from rule files."""
+    """Learn templates, Markov, N-gram, and PCFG grammar models from rule or password files."""
     _setup_logging(verbose)
 
     parser = Parser()
     rules: list[str] = []
+    raw_lines: list[str] = []
     for f in input_files:
         if not f.is_file():
             console.print(f"[red]File not found: {f}[/red]")
             raise typer.Exit(1)
         rules.extend(parser.parse_file(f))
+        with f.open("r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                stripped = line.rstrip("\n")
+                if stripped:
+                    raw_lines.append(stripped)
 
-    console.print(f"Loaded [cyan]{len(rules):,}[/cyan] rules.")
+    console.print(f"Loaded [cyan]{len(rules):,}[/cyan] rules, [cyan]{len(raw_lines):,}[/cyan] raw lines.")
 
     # Templates
     learner = TemplateLearner(parser)
@@ -426,6 +437,22 @@ def learn(
     vom.train(rules, parser)
     vom.save(markov_out)
     console.print(f"Markov model: [cyan]{markov_out}[/cyan]")
+
+    # N-gram (optional)
+    if ngram > 0:
+        engine = NGramEngine(n=ngram, smoothing=ngram_smoothing)
+        engine.train(rules, parser)
+        engine.save(ngram_out)
+        console.print(f"N-gram model ({ngram}-gram, {ngram_smoothing}): [cyan]{ngram_out}[/cyan]")
+
+    # PCFG grammar (optional) — learns from raw lines treated as password corpus
+    if grammar:
+        from .grammar import PCFGLearner
+        pcfg_learner = PCFGLearner()
+        pcfg_learner.learn(raw_lines)
+        pcfg = pcfg_learner.build()
+        pcfg.save(grammar_out)
+        console.print(f"PCFG grammar ({pcfg.total_passwords:,} passwords): [cyan]{grammar_out}[/cyan]")
 
 
 # ---------------------------------------------------------------------------
@@ -479,15 +506,21 @@ def train(
 @app.command()
 def evaluate(
     rules_file: Annotated[Path, typer.Argument(help="Rules file to evaluate")],
-    words_file: Annotated[Path, typer.Option("--words", help="Word list for evaluation")],
+    words_file: Annotated[Optional[Path], typer.Option("--wordlist", "--words", help="Word list for --stdout evaluation")] = None,
+    hash_file: Annotated[Optional[Path], typer.Option("--hash-file", help="Hash file for cracking-mode evaluation")] = None,
+    hash_type: Annotated[int, typer.Option("--hash-type", "-m", help="Hashcat hash type (e.g. 0 for MD5)")] = 0,
     hashcat_bin: Annotated[str, typer.Option("--hashcat-bin")] = "hashcat",
     timeout: Annotated[int, typer.Option("--timeout")] = 30,
     top_n: Annotated[int, typer.Option("--top-n")] = 100,
     output: Annotated[Path, typer.Option("--output")] = Path("eval_results.json"),
     verbose: _OPT_VERBOSE = 0,
 ) -> None:
-    """Evaluate rules against a word list using hashcat --stdout."""
+    """Evaluate rules against a word list using hashcat --stdout, or against a hash file."""
     _setup_logging(verbose)
+
+    if words_file is None and hash_file is None:
+        console.print("[red]Provide --wordlist for stdout evaluation or --hash-file for cracking evaluation.[/red]")
+        raise typer.Exit(1)
 
     parser = Parser()
     rules = parser.parse_file(rules_file)
@@ -495,27 +528,69 @@ def evaluate(
         console.print("[red]No valid rules found.[/red]")
         raise typer.Exit(1)
 
-    rng = random.Random()
-    words, _ = WordSampler.load_words(words_file, sample_size=5000, rng=rng)
-    if not words:
-        console.print("[red]No words loaded.[/red]")
-        raise typer.Exit(1)
-
-    evaluator = RuntimeEvaluator(hashcat_bin=hashcat_bin, timeout_sec=timeout)
     results: list[dict] = []
 
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-                  BarColumn(), console=console) as prog:
-        task = prog.add_task("Evaluating…", total=min(top_n, len(rules)))
-        for rule in rules[:top_n]:
-            ok, outs, err = evaluator.outputs_for_rule(rule, words)
+    if hash_file is not None:
+        # Cracking-mode evaluation: run hashcat against real hashes
+        if not hash_file.is_file():
+            console.print(f"[red]Hash file not found: {hash_file}[/red]")
+            raise typer.Exit(1)
+        if words_file is None or not words_file.is_file():
+            console.print("[red]--wordlist is required when using --hash-file.[/red]")
+            raise typer.Exit(1)
+        import subprocess
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".rule", delete=False) as rf:
+            for rule in rules[:top_n]:
+                rf.write(rule + "\n")
+            rule_tmp = Path(rf.name)
+        try:
+            cmd = [
+                hashcat_bin, "-a", "0", "-m", str(hash_type),
+                "--potfile-disable", "--quiet",
+                "-r", str(rule_tmp),
+                str(hash_file), str(words_file),
+            ]
+            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout * len(rules[:top_n]))
+            cracked_lines = [l for l in cp.stdout.splitlines() if ":" in l]
             results.append({
-                "rule": rule,
-                "outputs": len(outs),
-                "success": ok,
-                "error": err,
+                "mode": "cracking",
+                "hash_file": str(hash_file),
+                "wordlist": str(words_file),
+                "rules_file": str(rules_file),
+                "cracked": len(cracked_lines),
+                "returncode": cp.returncode,
             })
-            prog.advance(task)
+        except Exception as exc:  # noqa: BLE001
+            results.append({"mode": "cracking", "error": str(exc)})
+        finally:
+            rule_tmp.unlink(missing_ok=True)
+    else:
+        # stdout evaluation mode
+        assert words_file is not None
+        if not words_file.is_file():
+            console.print(f"[red]Word list not found: {words_file}[/red]")
+            raise typer.Exit(1)
+        rng = random.Random()
+        words, _ = WordSampler.load_words(words_file, sample_size=5000, rng=rng)
+        if not words:
+            console.print("[red]No words loaded.[/red]")
+            raise typer.Exit(1)
+
+        evaluator = RuntimeEvaluator(hashcat_bin=hashcat_bin, timeout_sec=timeout)
+
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                      BarColumn(), console=console) as prog:
+            task = prog.add_task("Evaluating…", total=min(top_n, len(rules)))
+            for rule in rules[:top_n]:
+                ok, outs, err = evaluator.outputs_for_rule(rule, words)
+                results.append({
+                    "rule": rule,
+                    "outputs": len(outs),
+                    "success": ok,
+                    "error": err,
+                })
+                prog.advance(task)
 
     results.sort(key=lambda r: r["outputs"], reverse=True)
     output.write_text(json.dumps(results, indent=2), encoding="utf-8")
@@ -584,9 +659,9 @@ def benchmark(
 def optimize(
     input_files: Annotated[list[Path], typer.Argument(help="Source rule files")],
     method: Annotated[str, typer.Option("--method", help="evolution|bayesian|mcts")] = "evolution",
-    output: Annotated[Path, typer.Option("--output")] = Path("optimized.rule"),
+    output: Annotated[Path, typer.Option("--output", "--out")] = Path("optimized.rule"),
     generations: Annotated[int, typer.Option("--generations")] = 50,
-    pop_size: Annotated[int, typer.Option("--pop-size")] = 200,
+    pop_size: Annotated[int, typer.Option("--pop-size", "--population")] = 200,
     target: Annotated[int, typer.Option("--target")] = 1000,
     verbose: _OPT_VERBOSE = 0,
 ) -> None:
@@ -692,34 +767,88 @@ def resume(
 
 @app.command()
 def report(
-    report_json: Annotated[Path, typer.Argument(help="Path to report JSON file")],
+    report_json: Annotated[Optional[Path], typer.Argument(help="Path to report JSON file (optional if --db is given)")] = None,
+    db: Annotated[Optional[Path], typer.Option("--db", help="SQLite database to generate report from")] = None,
     formats: Annotated[
         list[str],
         typer.Option("--format", "-f", help="Output format(s): json csv tsv md html pdf all"),
     ] = ["all"],  # noqa: B006
     output_dir: Annotated[Path, typer.Option("--out-dir")] = Path("reports"),
+    out: Annotated[Optional[Path], typer.Option("--out", help="Write a single output file (format inferred from extension)")] = None,
+    top_n: Annotated[int, typer.Option("--top-n", help="Top rules to include from database")] = 1000,
     verbose: _OPT_VERBOSE = 0,
 ) -> None:
-    """Generate reports from a stored JSON report file."""
+    """Generate reports from a stored JSON report file or a RuleForge database."""
     _setup_logging(verbose)
 
-    if not report_json.is_file():
-        console.print(f"[red]Report file not found: {report_json}[/red]")
+    if report_json is None and db is None:
+        console.print("[red]Provide a report JSON file or --db to source data from a database.[/red]")
         raise typer.Exit(1)
 
-    data = json.loads(report_json.read_text(encoding="utf-8"))
-    r = Report(
-        title=data.get("title", "RuleForge Report"),
-        timestamp=float(data.get("timestamp", time.time())),
-        config=data.get("config", {}),
-        analysis=data.get("analysis", {}),
-        generation=data.get("generation", {}),
-        top_rules=data.get("top_rules", []),
-    )
-    reporter = Reporter(r)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stem = report_json.stem
+    if db is not None:
+        # Build report from database
+        if not db.is_file():
+            console.print(f"[red]Database not found: {db}[/red]")
+            raise typer.Exit(1)
+        database = Database(db)
+        top_rules = database.top_rules_by_fitness(top_n)
+        database.close()
+        r = Report(
+            title=f"RuleForge Report — {db.name}",
+            config={"source": "database", "db": str(db), "top_n": top_n},
+            top_rules=[
+                {"rule": row["rule"], "score": row.get("fitness") or 0.0,
+                 "origin": row.get("origin") or "db"}
+                for row in top_rules
+            ],
+        )
+        stem = db.stem
+    else:
+        assert report_json is not None
+        if not report_json.is_file():
+            console.print(f"[red]Report file not found: {report_json}[/red]")
+            raise typer.Exit(1)
+        data = json.loads(report_json.read_text(encoding="utf-8"))
+        r = Report(
+            title=data.get("title", "RuleForge Report"),
+            timestamp=float(data.get("timestamp", time.time())),
+            config=data.get("config", {}),
+            analysis=data.get("analysis", {}),
+            generation=data.get("generation", {}),
+            top_rules=data.get("top_rules", []),
+        )
+        stem = report_json.stem
 
+    reporter = Reporter(r)
+
+    # Single-file output via --out
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        ext = out.suffix.lstrip(".").lower()
+        if ext == "json":
+            reporter.write_json(out)
+        elif ext == "csv":
+            reporter.write_csv(out)
+        elif ext == "tsv":
+            reporter.write_tsv(out)
+        elif ext in ("md", "markdown"):
+            reporter.write_markdown(out)
+        elif ext in ("html", "htm"):
+            reporter.write_html(out)
+        elif ext == "pdf":
+            try:
+                reporter.write_pdf(out)
+            except ImportError as exc:
+                console.print(f"[yellow]PDF skipped: {exc}[/yellow]")
+        else:
+            # Fall back to the first requested format, or html
+            fmt = formats[0] if formats and formats[0] != "all" else "html"
+            _write_report_format(reporter, fmt, out)
+        console.print(f"[green]Report written to {out}[/green]")
+        return
+
+    # Multi-format output to directory
+    output_dir.mkdir(parents=True, exist_ok=True)
     do_all = "all" in formats
     if do_all or "json" in formats:
         reporter.write_json(output_dir / f"{stem}.json")
@@ -738,6 +867,22 @@ def report(
             console.print(f"[yellow]PDF skipped: {exc}[/yellow]")
 
     console.print(f"[green]Reports written to {output_dir}[/green]")
+
+
+def _write_report_format(reporter: "Reporter", fmt: str, path: Path) -> None:
+    """Write a single format to *path*."""
+    if fmt == "json":
+        reporter.write_json(path)
+    elif fmt == "csv":
+        reporter.write_csv(path)
+    elif fmt == "tsv":
+        reporter.write_tsv(path)
+    elif fmt in ("md", "markdown"):
+        reporter.write_markdown(path)
+    elif fmt == "pdf":
+        reporter.write_pdf(path)
+    else:
+        reporter.write_html(path)
 
 
 # ---------------------------------------------------------------------------
