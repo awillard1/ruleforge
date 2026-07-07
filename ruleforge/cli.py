@@ -443,7 +443,7 @@ def learn(
         engine = NGramEngine(n=ngram, smoothing=ngram_smoothing)
         engine.train(rules, parser)
         engine.save(ngram_out)
-        console.print(f"N-gram model ({ngram}-gram, {ngram_smoothing}): [cyan]{ngram_out}[/cyan]")
+        console.print(f"PCFG grammar ({len(raw_lines):,} passwords): [cyan]{grammar_out}[/cyan]")
 
     # PCFG grammar (optional) — learns from raw lines treated as password corpus
     if grammar:
