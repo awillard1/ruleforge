@@ -549,7 +549,7 @@ def learn(
         pcfg_learner.learn(raw_lines)
         pcfg = pcfg_learner.build()
         pcfg.save(grammar_out)
-        console.print(f"PCFG grammar ({pcfg.total_passwords:,} passwords): [cyan]{grammar_out}[/cyan]")
+        console.print(f"PCFG grammar ({len(raw_lines):,} passwords): [cyan]{grammar_out}[/cyan]")
 
 
 # ---------------------------------------------------------------------------
