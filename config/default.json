@@ -1,0 +1,62 @@
+{
+  "generation": {
+    "count": 200000,
+    "max_ops": 10,
+    "mutate_ratio": 0.90,
+    "allow_param_fallback": false,
+    "workers": 0,
+    "worker_batch": 2500,
+    "max_rounds": 2000,
+    "mixture": {
+      "markov": 0.50,
+      "template": 0.10,
+      "random_explore": 0.05,
+      "mutate": 0.35
+    }
+  },
+  "markov": {
+    "order": 3,
+    "interpolate": true
+  },
+  "ngram": {
+    "n": 3,
+    "smoothing": "backoff",
+    "alpha": 1.0,
+    "discount": 0.75
+  },
+  "evolution": {
+    "population_size": 500,
+    "elite_fraction": 0.05,
+    "tournament_size": 5,
+    "crossover_prob": 0.70,
+    "mutation_prob": 0.30,
+    "adaptive_mutation": true,
+    "max_generations": 100
+  },
+  "scoring": {
+    "weights": {
+      "novelty": 1.0,
+      "coverage": 1.0,
+      "entropy": 0.5,
+      "uniqueness": 0.5,
+      "template_rarity": 0.6,
+      "markov_prob": 0.4
+    }
+  },
+  "runtime": {
+    "enabled": false,
+    "hashcat_bin": "hashcat",
+    "timeout": 30,
+    "eval_sample": 5000
+  },
+  "database": {
+    "path": "ruleforge.db"
+  },
+  "checkpoints": {
+    "directory": "checkpoints",
+    "keep_last": 5
+  },
+  "logging": {
+    "level": "INFO"
+  }
+}
