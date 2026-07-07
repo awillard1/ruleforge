@@ -1,0 +1,91 @@
+# RuleForge default configuration (YAML)
+
+generation:
+  count: 200000
+  max_ops: 10
+  mutate_ratio: 0.90
+  allow_param_fallback: false
+  workers: 0                # 0 = auto-detect (cpu_count - 1)
+  worker_batch: 2500
+  max_rounds: 2000
+
+  mixture:
+    markov: 0.50
+    template: 0.10
+    random_explore: 0.05
+    mutate: 0.35
+
+markov:
+  order: 3
+  interpolate: true
+  lambdas: [0.2, 0.3, 0.5]
+
+ngram:
+  n: 3
+  smoothing: backoff       # laplace | backoff | kneser_ney
+  alpha: 1.0               # Laplace smoothing constant
+  discount: 0.75           # KN / back-off discount
+
+evolution:
+  population_size: 500
+  elite_fraction: 0.05
+  tournament_size: 5
+  crossover_prob: 0.70
+  mutation_prob: 0.30
+  adaptive_mutation: true
+  max_generations: 100
+  stagnation_limit: 15
+  checkpoint_interval: 10
+
+bayesian:
+  n_initial: 20
+  n_iterations: 100
+  kappa: 2.0
+  gp_length_scale: 1.0
+
+mcts:
+  n_simulations: 200
+  max_depth: 10
+  exploration_constant: 1.414
+  rollout_depth: 5
+
+scoring:
+  weights:
+    novelty: 1.0
+    coverage: 1.0
+    entropy: 0.5
+    uniqueness: 0.5
+    runtime: 0.3
+    historical: 0.8
+    param_diversity: 0.5
+    op_diversity: 0.7
+    template_rarity: 0.6
+    markov_prob: 0.4
+    ngram_prob: 0.4
+    grammar: 0.3
+
+runtime:
+  enabled: false
+  hashcat_bin: hashcat
+  timeout: 30
+  eval_sample: 5000
+  min_novel_outputs: 5
+  dedupe_words: true
+  stratified_sample: true
+  max_per_signature: 400
+  max_per_stem: 150
+
+database:
+  path: ruleforge.db
+
+checkpoints:
+  directory: checkpoints
+  keep_last: 5
+
+logging:
+  level: INFO    # DEBUG | INFO | WARNING | ERROR
+  file: null     # path or null for console-only
+
+plugins:
+  directories:
+    - plugins/
