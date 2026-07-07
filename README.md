@@ -81,7 +81,7 @@ pip install ruleforge
 ### Analyse an existing rule file
 
 ```bash
-ruleforge analyze rockyou.rule --json
+ruleforge analyze rockyou.rule
 ```
 
 ### Generate new rules
