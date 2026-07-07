@@ -421,10 +421,69 @@ def _worker_payload_to_generator(payload: dict[str, Any]) -> RuleGenerator:
     )
 
 
+def _build_rule_from_vom(
+    gen: "RuleGenerator",
+    vom: Any,
+    max_ops: int,
+) -> str:
+    """Generate a rule using a pre-trained VariableOrderMarkov model.
+
+    Samples an operation sequence from *vom*, then parameterises each
+    operation using the generator's learned parameter frequencies.
+    """
+    ops: list[str] = vom.sample(max_len=max_ops)
+    if not ops:
+        return ""
+    toks: list[Token] = []
+    for c in ops:
+        if c not in gen._allowed_cmds:
+            return ""
+        p = gen._sample_param(c)
+        if p is None:
+            return ""
+        toks.append(Token(c, p))
+    rule = gen._parser.serialize(toks)
+    return rule if gen._valid(rule, max_ops=max_ops) else ""
+
+
+def _build_rule_from_templates(
+    gen: "RuleGenerator",
+    templates_data: list[dict[str, Any]],
+    max_ops: int,
+) -> str:
+    """Instantiate a randomly selected pre-learned template.
+
+    Each entry in *templates_data* must contain a ``"steps"`` key with a
+    list of ``[cmd, param_type]`` pairs (as written by
+    :meth:`~ruleforge.templates.TemplateLearner.export_json`).
+    """
+    if not templates_data:
+        return gen._build_from_template(max_ops)
+    entry = gen._rng.choice(templates_data)
+    steps = entry.get("steps", [])
+    if not steps:
+        return gen._build_from_template(max_ops)
+    toks: list[Token] = []
+    for item in steps:
+        cmd = item[0] if isinstance(item, (list, tuple)) else item.get("cmd", "")
+        if cmd not in gen._allowed_cmds:
+            return ""
+        p = gen._sample_param(cmd)
+        if p is None:
+            return ""
+        toks.append(Token(cmd, p))
+    if not toks:
+        return ""
+    rule = gen._parser.serialize(toks)
+    return rule if gen._valid(rule, max_ops=max_ops) else ""
+
+
 def worker_generate(payload: dict[str, Any]) -> dict[str, Any]:
     """Top-level worker function (spawn-safe).
 
     Generates a batch and scores each candidate with the offline scorer.
+    Optionally uses a pre-trained VariableOrderMarkov model (``vom_data``)
+    and/or pre-learned templates (``templates_data``) from the payload.
     """
     import traceback as _tb
 
@@ -434,6 +493,26 @@ def worker_generate(payload: dict[str, Any]) -> dict[str, Any]:
         max_ops = int(payload.get("max_ops", 10))
         source_set = set(payload["source_rules"])
 
+        # Reconstruct optional pre-trained VOM from payload
+        vom: Any = None
+        if "vom_data" in payload:
+            try:
+                from .markov import VariableOrderMarkov, MarkovModel, MarkovSampler
+                vom = VariableOrderMarkov()
+                vom._models = [MarkovModel.from_dict(d) for d in payload["vom_data"]]
+                if vom._models:
+                    vom._sampler = MarkovSampler(
+                        model=vom._models[-1],
+                        lower_models=vom._models[:-1],
+                        rng=gen._rng,
+                    )
+                else:
+                    vom = None
+            except Exception:  # noqa: BLE001
+                vom = None
+
+        templates_data: list[dict[str, Any]] | None = payload.get("templates_data")
+
         out: list[tuple[str, float, str]] = []
         tries = 0
         max_tries = batch_size * 12
@@ -441,13 +520,24 @@ def worker_generate(payload: dict[str, Any]) -> dict[str, Any]:
         rng = random.Random(payload["seed"])
         while len(out) < batch_size and tries < max_tries:
             tries += 1
-            mutate = rng.random() < payload.get("mutate_ratio", 0.90)
-            if mutate and gen._source:
+            mutate_ratio = payload.get("mutate_ratio", 0.90)
+            roll = rng.random()
+            if roll < mutate_ratio and gen._source:
                 cand = gen.mutate(rng.choice(gen._source), max_ops=max_ops)
                 origin = "mutate"
             else:
-                cand = gen._build_markov(max_ops=max_ops)
-                origin = "markov"
+                # Use pre-trained models when available; fall back to basic markov
+                # Distribute the non-mutate budget: 70% markov/vom, 30% templates
+                use_template = (templates_data is not None) and (rng.random() < 0.30)
+                if use_template:
+                    cand = _build_rule_from_templates(gen, templates_data, max_ops)  # type: ignore[arg-type]
+                    origin = "template"
+                elif vom is not None:
+                    cand = _build_rule_from_vom(gen, vom, max_ops)
+                    origin = "vom"
+                else:
+                    cand = gen._build_markov(max_ops=max_ops)
+                    origin = "markov"
             if not cand or cand in source_set:
                 continue
             score = gen.offline_score(cand)
