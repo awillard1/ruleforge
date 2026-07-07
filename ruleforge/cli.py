@@ -87,6 +87,31 @@ _OPT_DB = Annotated[Optional[Path], typer.Option("--db", help="SQLite database p
 
 
 # ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+
+def _load_config(config_path: Path) -> dict:
+    """Load a YAML, JSON, or TOML configuration file and return it as a dict."""
+    suffix = config_path.suffix.lower()
+    text = config_path.read_text(encoding="utf-8")
+    if suffix in (".yaml", ".yml"):
+        import yaml
+        return yaml.safe_load(text) or {}
+    if suffix == ".json":
+        return json.loads(text)
+    if suffix == ".toml":
+        try:
+            import tomllib  # Python 3.11+
+        except ImportError:
+            import tomli as tomllib  # type: ignore[no-redef]
+        return tomllib.loads(text)
+    # Fallback: try YAML
+    import yaml
+    return yaml.safe_load(text) or {}
+
+
+# ---------------------------------------------------------------------------
 # analyze
 # ---------------------------------------------------------------------------
 
@@ -156,27 +181,68 @@ def analyze(
 def generate(
     input_files: Annotated[list[Path], typer.Argument(help="Source rule file(s)")],
     output: Annotated[Path, typer.Option("--output", "--out", "-o")] = Path("learned.rule"),
-    count: Annotated[int, typer.Option("--count", "-g", help="Target rule count")] = 200_000,
+    count: Annotated[Optional[int], typer.Option("--count", "-g", help="Target rule count")] = None,
     seed: Annotated[Optional[int], typer.Option("--seed")] = None,
-    max_ops: Annotated[int, typer.Option("--max-ops")] = 10,
-    mutate_ratio: Annotated[float, typer.Option("--mutate-ratio")] = 0.90,
-    allow_fallback: Annotated[bool, typer.Option("--allow-param-fallback")] = False,
-    workers: Annotated[int, typer.Option("--workers")] = max(1, (os.cpu_count() or 4) - 1),
-    worker_batch: Annotated[int, typer.Option("--worker-batch")] = 2500,
-    max_rounds: Annotated[int, typer.Option("--max-rounds")] = 2000,
+    max_ops: Annotated[Optional[int], typer.Option("--max-ops")] = None,
+    mutate_ratio: Annotated[Optional[float], typer.Option("--mutate-ratio")] = None,
+    allow_fallback: Annotated[Optional[bool], typer.Option("--allow-param-fallback")] = None,
+    workers: Annotated[Optional[int], typer.Option("--workers")] = None,
+    worker_batch: Annotated[Optional[int], typer.Option("--worker-batch")] = None,
+    max_rounds: Annotated[Optional[int], typer.Option("--max-rounds")] = None,
     runtime_score: Annotated[bool, typer.Option("--runtime-score")] = False,
-    hashcat_bin: Annotated[str, typer.Option("--hashcat-bin")] = "hashcat",
-    hashcat_timeout: Annotated[int, typer.Option("--hashcat-timeout")] = 30,
+    hashcat_bin: Annotated[Optional[str], typer.Option("--hashcat-bin")] = None,
+    hashcat_timeout: Annotated[Optional[int], typer.Option("--hashcat-timeout")] = None,
     words_file: Annotated[Optional[Path], typer.Option("--words")] = None,
-    eval_sample: Annotated[int, typer.Option("--eval-sample")] = 5000,
+    eval_sample: Annotated[Optional[int], typer.Option("--eval-sample")] = None,
     report_file: Annotated[Path, typer.Option("--report")] = Path("report.json"),
     score_tsv: Annotated[Path, typer.Option("--score-tsv")] = Path("scores.tsv"),
     errors_log: Annotated[Path, typer.Option("--errors-log")] = Path("errors.log"),
+    config: Annotated[Optional[Path], typer.Option("--config", "-c", help="Config YAML/JSON/TOML file")] = None,
+    markov_model: Annotated[Optional[Path], typer.Option("--markov-model", help="Pre-trained Markov model from 'learn'")] = None,
+    templates_file: Annotated[Optional[Path], typer.Option("--templates", help="Pre-learned templates JSON from 'learn'")] = None,
+    ngram_model: Annotated[Optional[Path], typer.Option("--ngram-model", help="Pre-trained N-gram model from 'learn'")] = None,
     verbose: _OPT_VERBOSE = 0,
     db: _OPT_DB = None,
 ) -> None:
     """Generate novel Hashcat rules using learned statistics."""
     _setup_logging(verbose)
+
+    # --- Load config file and apply defaults ---
+    cfg: dict = {}
+    if config is not None:
+        if not config.is_file():
+            console.print(f"[red]Config file not found: {config}[/red]")
+            raise typer.Exit(1)
+        cfg = _load_config(config)
+
+    gen_cfg = cfg.get("generation", {})
+    rt_cfg = cfg.get("runtime", {})
+    db_cfg = cfg.get("database", {})
+    learn_cfg = cfg.get("learn", {})
+
+    # Apply config defaults (explicit CLI value wins over config)
+    count = count if count is not None else int(gen_cfg.get("count", 200_000))
+    max_ops = max_ops if max_ops is not None else int(gen_cfg.get("max_ops", 10))
+    mutate_ratio = mutate_ratio if mutate_ratio is not None else float(gen_cfg.get("mutate_ratio", 0.90))
+    allow_fallback = allow_fallback if allow_fallback is not None else bool(gen_cfg.get("allow_param_fallback", False))
+    workers = workers if workers is not None else int(gen_cfg.get("workers") or max(1, (os.cpu_count() or 4) - 1))
+    worker_batch = worker_batch if worker_batch is not None else int(gen_cfg.get("worker_batch", 2500))
+    max_rounds = max_rounds if max_rounds is not None else int(gen_cfg.get("max_rounds", 2000))
+    hashcat_bin = hashcat_bin if hashcat_bin is not None else str(rt_cfg.get("hashcat_bin", "hashcat"))
+    hashcat_timeout = hashcat_timeout if hashcat_timeout is not None else int(rt_cfg.get("timeout", 30))
+    eval_sample = eval_sample if eval_sample is not None else int(rt_cfg.get("eval_sample", 5000))
+
+    # Apply model file paths from config if not provided on CLI
+    if markov_model is None and learn_cfg.get("markov_out"):
+        markov_model = Path(learn_cfg["markov_out"])
+    if templates_file is None and learn_cfg.get("templates_out"):
+        templates_file = Path(learn_cfg["templates_out"])
+    if ngram_model is None and learn_cfg.get("ngram_out"):
+        ngram_model = Path(learn_cfg["ngram_out"])
+
+    # Apply database path from config if not set on CLI
+    if db is None and db_cfg.get("path"):
+        db = Path(db_cfg["path"])
 
     _seed = seed if seed is not None else int(time.time())
     rng = random.Random(_seed)
@@ -208,6 +274,31 @@ def generate(
     console.print(
         f"Loaded [cyan]{len(analyzer.unique_rules):,}[/cyan] unique source rules."
     )
+
+    # --- Load pre-trained models from learn output ---
+    vom_data: list | None = None
+    if markov_model is not None:
+        if not markov_model.is_file():
+            console.print(f"[yellow]Markov model not found: {markov_model} — skipping.[/yellow]")
+        else:
+            vom_data = json.loads(markov_model.read_text(encoding="utf-8"))
+            console.print(f"Loaded Markov model: [cyan]{markov_model}[/cyan]")
+
+    templates_data: list | None = None
+    if templates_file is not None:
+        if not templates_file.is_file():
+            console.print(f"[yellow]Templates file not found: {templates_file} — skipping.[/yellow]")
+        else:
+            templates_data = json.loads(templates_file.read_text(encoding="utf-8"))
+            console.print(f"Loaded [cyan]{len(templates_data):,}[/cyan] templates from {templates_file}")
+
+    ngram_data: dict | None = None
+    if ngram_model is not None:
+        if not ngram_model.is_file():
+            console.print(f"[yellow]N-gram model not found: {ngram_model} — skipping.[/yellow]")
+        else:
+            ngram_data = json.loads(ngram_model.read_text(encoding="utf-8"))
+            console.print(f"Loaded N-gram model: [cyan]{ngram_model}[/cyan]")
 
     # --- Optional runtime scorer ---
     runtime_mode = bool(runtime_score and words_file)
@@ -261,6 +352,12 @@ def generate(
         "batch_size": worker_batch,
         "allow_param_fallback": allow_fallback,
     }
+    if vom_data is not None:
+        payload_template["vom_data"] = vom_data
+    if templates_data is not None:
+        payload_template["templates_data"] = templates_data
+    if ngram_data is not None:
+        payload_template["ngram_data"] = ngram_data
 
     generated: dict[str, dict] = {}
     attempts_est = 0
@@ -443,7 +540,7 @@ def learn(
         engine = NGramEngine(n=ngram, smoothing=ngram_smoothing)
         engine.train(rules, parser)
         engine.save(ngram_out)
-        console.print(f"PCFG grammar ({len(raw_lines):,} passwords): [cyan]{grammar_out}[/cyan]")
+        console.print(f"N-gram model ({ngram}-gram, {ngram_smoothing}): [cyan]{ngram_out}[/cyan]")
 
     # PCFG grammar (optional) — learns from raw lines treated as password corpus
     if grammar:
