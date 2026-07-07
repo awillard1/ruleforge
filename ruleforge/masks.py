@@ -129,7 +129,7 @@ class MaskLearner:
             self._total_passwords += 1
 
         self._score_all()
-        logger.info(
+        logger.debug(
             "Mask learner: %d passwords → %d unique masks",
             self._total_passwords,
             len(self._mask_stats),

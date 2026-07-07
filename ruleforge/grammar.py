@@ -150,7 +150,7 @@ class PCFGLearner:
                 self._counts[self.ROOT][structure] += 1
                 self._total_passwords += 1
 
-        logger.info(
+        logger.debug(
             "PCFG: learned from %d passwords, %d unique structures",
             self._total_passwords,
             len(self._counts[self.ROOT]),
